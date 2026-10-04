@@ -1,0 +1,258 @@
+// prisma/schema.prisma
+// Play Hot Leads — multi-tenant (isolamento por tenantId em app-layer) sobre
+// PostgreSQL: Neon na Vercel (DATABASE_URL com sslmode=require) e PostgreSQL
+// embedded no dev local (mini-services/pg-local).
+// Campos JSON vivem como String (prisma 6 não modela arrays primitivos) —
+// shape idêntico entre ambientes; RLS é adição futura sem mudança de domínio.
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Cliente do SaaS. Todo dado do produto pendura de um tenant.
+model Tenant {
+  id        String   @id @default(cuid())
+  name      String
+  plan      String   @default("free")
+  /// 'pt' | 'en' | 'es'
+  language  String   @default("pt")
+  createdAt DateTime @default(now())
+
+  settings  TenantSettings?
+  searches  Search[]
+  leads     Lead[]
+  campaigns Campaign[]
+  user      User?
+}
+
+/// Conta do SaaS — 1 usuário por tenant (workspace individual).
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  /// scrypt com salt aleatório — formato "salt.hash" (base64)
+  passwordHash String
+  name         String
+  /// 'user' | 'master' — master tem painel administrativo total
+  role         String   @default("user")
+  /// 'active' | 'blocked' — bloqueado não faz login nem busca
+  status       String   @default("active")
+  /// saldo atual de créditos (1 crédito = 1 lead entregue)
+  credits      Int      @default(150)
+  planId       String?
+  plan         Plan?    @relation(fields: [planId], references: [id], onDelete: SetNull)
+
+  tenantId String @unique
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  payments Payment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// Plano comercial — editável 100% pelo painel master.
+model Plan {
+  id         String @id @default(cuid())
+  name       String @unique
+  /// preço em centavos (BRL) — 0 = gratuito
+  priceCents Int    @default(0)
+  /// créditos que o plano entrega ao ser contratado
+  credits    Int    @default(0)
+  /// JSON string[] — bullets exibidos no checkout/landing
+  features   String @default("[]")
+  active     Boolean @default(true)
+  highlight  Boolean @default(false)
+  sortOrder  Int     @default(0)
+
+  users    User[]
+  payments Payment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// Cobrança — gateway real (Mercado Pago/Asaas) ou demo quando sem credencial.
+model Payment {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  planId    String?
+  plan      Plan?    @relation(fields: [planId], references: [id], onDelete: SetNull)
+  /// snapshot do nome no momento da compra
+  planName  String
+  amountCents Int
+  credits   Int
+  /// 'pix' | 'mercadopago' | 'credit_card' | 'asaas'
+  method    String
+  /// 'mercadopago' | 'asaas' | 'demo' | 'manual'
+  gateway   String   @default("demo")
+  /// 'pending' | 'paid' | 'failed' | 'expired'
+  status    String   @default("pending")
+  externalId String?
+  checkoutUrl String?
+  /// JSON — resposta do gateway / metadata
+  payload   String?
+
+  createdAt DateTime  @default(now())
+  paidAt    DateTime?
+
+  @@index([userId, createdAt])
+  @@index([status])
+  @@index([externalId])
+}
+
+/// Config global do SaaS — editável pelo master. Segredos ficam cifrados.
+model AppConfig {
+  key        String   @id
+  value      String   @default("{}")
+  secretsEnc String   @default("")
+  updatedAt  DateTime @updatedAt
+}
+
+/// Config de providers/proxy/keys — segredos cifrados (AES-256-GCM).
+model TenantSettings {
+  id        String   @id @default(cuid())
+  tenantId  String   @unique
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  /// JSON: Record<ProviderId, boolean>
+  enabledProviders String @default("{}")
+  /// JSON: Record<ProviderId, 'demo' | 'live'>
+  providerModes    String @default("{}")
+  /// JSON cifrado: Record<ProviderId, string>
+  apiKeysEnc       String @default("")
+  /// JSON cifrado: ProxyConfig | null
+  proxyEnc         String @default("")
+
+  updatedAt DateTime @updatedAt
+}
+
+/// Cada clique em "Procurar".
+model Search {
+  id        String    @id @default(cuid())
+  tenantId  String
+  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  niche     String
+  location  String
+  country   String
+  /// running | done | failed | cancelled
+  status    String    @default("running")
+  totalFound  Int     @default(0)
+  duplicates  Int     @default(0)
+  enriched    Int     @default(0)
+  error     String?
+  createdAt DateTime  @default(now())
+  finishedAt DateTime?
+
+  leads     Lead[]
+  events    SearchEvent[]
+
+  @@index([tenantId, createdAt])
+}
+
+/// Eventos de progresso da busca (providers, leads, logs). Persistidos para
+/// que o SSE funcione entre instâncias serverless (Vercel): quem executa a
+/// busca grava, quem serve o stream lê.
+model SearchEvent {
+  id        Int      @id @default(autoincrement())
+  searchId  String
+  search    Search   @relation(fields: [searchId], references: [id], onDelete: Cascade)
+  /// provider | lead | update | dedup | log | done | cancelled | error
+  type      String
+  /// SearchEvent serializado em JSON
+  payload   String
+  createdAt DateTime @default(now())
+
+  @@index([searchId, id])
+  @@index([createdAt])
+}
+
+/// O produto final, multi-fonte, deduplicado no nível do banco.
+model Lead {
+  id             String   @id @default(cuid())
+  tenantId       String
+  tenant         Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  searchId       String?
+  search         Search?  @relation(fields: [searchId], references: [id], onDelete: SetNull)
+
+  name           String
+  /// nome normalizado (lowercase, sem pontuação) — insumo do dedup
+  normalizedName String
+  phone          String?
+  /// formato internacional E.164 (+5511...)
+  phoneE164      String?
+  whatsapp       Boolean  @default(false)
+  email          String?
+  website        String?
+  domain         String?
+  mapsUrl        String?
+  address        String?
+  country        String
+  /// JSON: { instagram?, facebook?, linkedin? }
+  socials        String   @default("{}")
+  rating         Float?
+  /// JSON string[]: ['google-places','yelp'] — prova multi-fonte
+  sources        String   @default("[]")
+  /// sha1(phoneE164|domain|normalizedName) — unique por tenant = dedup no banco
+  dedupKey       String
+  /// new | contacted | negotiation | won | lost
+  kanbanStage    String   @default("new")
+  /// ok | waiting | not_interested | null
+  contactStatus  String?
+  note           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([tenantId, dedupKey])
+  @@index([tenantId, kanbanStage])
+  @@index([tenantId, searchId])
+}
+
+/// Campanha de WhatsApp (motor de disparo simulado + wa.me real por lead).
+model Campaign {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name      String
+  template  String
+  /// estágio do Kanban usado pra segmentar destinatários
+  stage     String
+  /// running | done
+  status    String   @default("running")
+  total     Int      @default(0)
+  sent      Int      @default(0)
+  delivered Int      @default(0)
+  replied   Int      @default(0)
+
+  createdAt DateTime @default(now())
+  /// última atividade — permite retomar campanha cuja execução serverless acabou
+  updatedAt DateTime @default(now()) @updatedAt
+  messages  CampaignMessage[]
+
+  @@index([tenantId, createdAt])
+}
+
+model CampaignMessage {
+  id         String   @id @default(cuid())
+  campaignId String
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  leadId     String
+  leadName   String
+  phone      String
+  body       String
+  /// queued | sent | delivered | replied | failed
+  status     String   @default("queued")
+
+  createdAt DateTime @default(now())
+
+  @@index([campaignId, status])
+}

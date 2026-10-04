@@ -1,0 +1,6 @@
+# fora do deploy da Vercel (dev local / legado do builder)
+mini-services
+examples
+tests
+Caddyfile
+worklog.md
